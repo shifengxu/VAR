@@ -140,8 +140,11 @@ class VAR(nn.Module):
         :param more_smooth: smoothing the pred using gumbel softmax; only used in visualization, not used in FID/IS benchmarking
         :return: if returns_vemb: list of embedding h_BChw := vae_embed(idx_Bl), else: list of idx_Bl
         """
-        if g_seed is None: rng = None
-        else: self.rng.manual_seed(g_seed); rng = self.rng
+        if g_seed is None:
+            rng = None
+        else:
+            self.rng.manual_seed(g_seed)
+            rng = self.rng
         
         if label_B is None:
             label_B = torch.multinomial(self.uniform_prob, num_samples=B, replacement=True, generator=rng).reshape(B)
@@ -149,13 +152,27 @@ class VAR(nn.Module):
             label_B = torch.full((B,), fill_value=self.num_classes if label_B < 0 else label_B, device=self.lvl_1L.device)
         
         sos = cond_BD = self.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))
+        # sos.shape: torch.Size([4, 1024])  <-- if B is 2
         
         lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
+        # lvl_pos.shape: torch.Size([1, 680, 1024])
         next_token_map = sos.unsqueeze(1).expand(2 * B, self.first_l, -1) + self.pos_start.expand(2 * B, self.first_l, -1) + lvl_pos[:, :self.first_l]
-        
+        # next_token_map.shape: torch.Size([4, 1, 1024])  <-- if B is 2
+
         cur_L = 0
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
+        # f_hat.shape: torch.Size([2, 32, 16, 16])  <-- if B is 2
         
+        print(f"VAR::autoregressive_infer_cfg()...")
+        print(f"patch_nums : {self.patch_nums}")
+        print(f"more_smooth: {more_smooth}")
+        print(f"self.Cvae  : {self.Cvae}")
+        print(f"g_seed: {g_seed}")
+        print(f"self.C: {self.C}")
+        print(f"self.V: {self.V}")
+        print(f"cfg   : {cfg}")
+        print(f"top_k : {top_k}")
+        print(f"top_p : {top_p}")
         for b in self.blocks: b.attn.kv_caching(True)
         for si, pn in enumerate(self.patch_nums):   # si: i-th segment
             ratio = si / self.num_stages_minus_1
@@ -168,24 +185,29 @@ class VAR(nn.Module):
             for b in self.blocks:
                 x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
             logits_BlV = self.get_logits(x, cond_BD)
+            # x.shape   : [4, pn*pn, 1024]
+            # logits_BlV: [4, pn*pn, 4096]
             
             t = cfg * ratio
+            print(f"si:{si:2d}, pn:{pn:2d}. ratio: {ratio:.4f}. t:{t:.4f}")
             logits_BlV = (1+t) * logits_BlV[:B] - t * logits_BlV[B:]
-            
+
             idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
+            # idx_Bl.shape: torch.Size([2, pn*pn])
+            # idx_Bl varies depends on the rng, while the rng is a Generator depending on g_seed.
             if not more_smooth: # this is the default case
                 h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)   # B, l, Cvae
             else:   # not used when evaluating FID/IS/Precision/Recall
                 gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)   # refer to mask-git
                 h_BChw = gumbel_softmax_with_rng(logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
-            
+
             h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
             f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw)
             if si != self.num_stages_minus_1:   # prepare for next stage
                 next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
                 next_token_map = self.word_embed(next_token_map) + lvl_pos[:, cur_L:cur_L + self.patch_nums[si+1] ** 2]
                 next_token_map = next_token_map.repeat(2, 1, 1)   # double the batch sizes due to CFG
-        
+
         for b in self.blocks: b.attn.kv_caching(False)
         return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
     
